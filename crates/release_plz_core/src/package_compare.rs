@@ -33,10 +33,15 @@ pub fn are_packages_equal(
 
     // When a package is published to a cargo registry, the original `Cargo.toml` file is stored as `Cargo.toml.orig`.
     // We need to rename it to `Cargo.toml.orig.orig`, because this name is reserved, and `cargo package` will fail if it exists.
-    rename(
-        registry_package.join("Cargo.toml.orig"),
-        registry_package.join("Cargo.toml.orig.orig"),
-    )?;
+    // In the source-dir fallback path, `Cargo.toml.orig` doesn't exist, so skip the rename.
+    let cargo_toml_orig = registry_package.join("Cargo.toml.orig");
+    let has_orig = cargo_toml_orig.exists();
+    if has_orig {
+        rename(
+            &cargo_toml_orig,
+            registry_package.join("Cargo.toml.orig.orig"),
+        )?;
+    }
 
     let local_package_files = get_cargo_package_files(local_package).with_context(|| {
         format!("cannot determine packaged files of local package {local_package:?}")
@@ -46,10 +51,12 @@ pub fn are_packages_equal(
     })?;
 
     // Rename the file to the original name.
-    rename(
-        registry_package.join("Cargo.toml.orig.orig"),
-        registry_package.join("Cargo.toml.orig"),
-    )?;
+    if has_orig {
+        rename(
+            registry_package.join("Cargo.toml.orig.orig"),
+            registry_package.join("Cargo.toml.orig"),
+        )?;
+    }
 
     let local_files = local_package_files
         .iter()
@@ -118,10 +125,18 @@ pub fn get_cargo_package_files(package: &Utf8Path) -> anyhow::Result<Vec<Utf8Pat
         debug!("Packaged files: {:?}", list);
         Ok(list)
     } else {
-        let list = get_cargo_package_list(package)
-            .context("cannot get packaged files from cargo package list")?;
-        debug!("Cargo Packaged files: {:?}", list);
-        Ok(list)
+        match get_cargo_package_list(package) {
+            Ok(list) => {
+                debug!("Cargo Packaged files: {:?}", list);
+                Ok(list)
+            }
+            Err(e) => {
+                // Fallback: list source files directly when `cargo package --list` fails
+                // (e.g. `git_only` packages with private/unpublished dependencies).
+                debug!("cargo package --list failed ({e:#}), listing source files directly");
+                list_source_files(package)
+            }
+        }
     }
 }
 
@@ -175,15 +190,50 @@ fn list_packaged_files(package: &Utf8Path) -> anyhow::Result<Vec<Utf8PathBuf>> {
     Ok(files)
 }
 
+/// List source files in a crate directory, excluding build artifacts.
+/// Used as a fallback when `cargo package --list` is unavailable.
+fn list_source_files(package: &Utf8Path) -> anyhow::Result<Vec<Utf8PathBuf>> {
+    let excluded_dirs: &[&str] = &["target", ".git"];
+    let mut files = Vec::new();
+    let mut dirs = vec![package.to_path_buf()];
+
+    while let Some(dir) = dirs.pop() {
+        for entry in fs_err::read_dir(&dir).with_context(|| format!("cannot read dir {dir:?}"))? {
+            let entry = entry.with_context(|| format!("cannot read dir entry in {dir:?}"))?;
+            let path = Utf8PathBuf::from_path_buf(entry.path())
+                .map_err(|path| anyhow::anyhow!("non-utf8 path in package: {path:?}"))?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("cannot read file type for {path:?}"))?;
+
+            if file_type.is_dir() {
+                let dir_name = path.file_name().unwrap_or_default();
+                if !excluded_dirs.contains(&dir_name) {
+                    dirs.push(path);
+                }
+            } else {
+                let rel_path = path
+                    .strip_prefix(package)
+                    .with_context(|| format!("can't find {package:?} prefix in {path:?}"))?;
+                files.push(rel_path.to_path_buf());
+            }
+        }
+    }
+
+    files.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    Ok(files)
+}
+
 fn are_cargo_toml_equal(local_package: &Utf8Path, registry_package: &Utf8Path) -> bool {
     // When a package is published to a cargo registry, the original `Cargo.toml` file is stored as
-    // `Cargo.toml.orig`
+    // `Cargo.toml.orig`. In the source-dir fallback, compare `Cargo.toml` directly.
     let cargo_orig = format!("{CARGO_TOML}.orig");
-    are_files_equal(
-        &local_package.join(CARGO_TOML),
-        &registry_package.join(cargo_orig),
-    )
-    .unwrap_or(false)
+    let registry_toml = if registry_package.join(&cargo_orig).exists() {
+        registry_package.join(cargo_orig)
+    } else {
+        registry_package.join(CARGO_TOML)
+    };
+    are_files_equal(&local_package.join(CARGO_TOML), &registry_toml).unwrap_or(false)
 }
 
 /// Returns true if the README file of the local package is the same as the one in the registry.

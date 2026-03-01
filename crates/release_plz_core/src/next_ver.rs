@@ -145,26 +145,35 @@ fn process_git_only_package(
     repo.checkout_commit(&release_commit)
         .context("checkout release commit for package")?;
 
-    // Run cargo package so we have our finalized package
-    run_cargo_package(&worktree).context("run cargo package")?;
-
-    // Get the package metadata
-    let single_package = get_cargo_package(&worktree, &package.name).with_context(|| {
-        format!(
-            "get cargo package {} from worktree at {:?}",
-            package.name,
-            worktree.path()
-        )
-    })?;
+    // Run cargo package so we have our finalized package.
+    // If cargo package fails (e.g. private workspace crates with `publish = false`
+    // and versioned path deps), fall back to source directory comparison.
+    let single_package = match run_cargo_package(&worktree) {
+        Ok(()) => get_cargo_package(&worktree, &package.name).with_context(|| {
+            format!(
+                "get cargo package {} from worktree at {:?}",
+                package.name,
+                worktree.path()
+            )
+        })?,
+        Err(e) => {
+            info!(
+                "cargo package failed for {} ({e:#}), using source directory for comparison",
+                package.name
+            );
+            get_cargo_package_from_source(&worktree, &package.name)?
+        }
+    };
 
     let registry_package = RegistryPackage::new(single_package, Some(release_commit));
     Ok(Some((registry_package, worktree)))
 }
 
-/// Run cargo package within a worktree
+/// Run cargo package within a worktree.
+/// Uses `--workspace` to create a tmp-registry so versioned path deps resolve.
 fn run_cargo_package(worktree: &GitWorkTree) -> anyhow::Result<()> {
     let worktree_path = to_utf8_path(worktree.path())?;
-    let output = run_cargo(worktree_path, &["package", "--allow-dirty"])
+    let output = run_cargo(worktree_path, &["package", "--allow-dirty", "--workspace"])
         .context("run cargo package in worktree")?;
 
     if !output.status.success() {
@@ -172,6 +181,27 @@ fn run_cargo_package(worktree: &GitWorkTree) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Get package metadata from source directory when `cargo package` is unavailable.
+/// Used as a fallback for `git_only` packages with private dependencies.
+fn get_cargo_package_from_source(
+    worktree: &GitWorkTree,
+    package_name: &str,
+) -> anyhow::Result<Package> {
+    let worktree_path = to_utf8_path(worktree.path())?;
+    let manifest_path = worktree_path.join("Cargo.toml");
+    let metadata = MetadataCommand::new()
+        .current_dir(worktree_path.as_std_path())
+        .no_deps()
+        .manifest_path(&manifest_path)
+        .exec()
+        .context("get cargo metadata for worktree")?;
+    metadata
+        .packages
+        .into_iter()
+        .find(|x| x.name == package_name)
+        .with_context(|| format!("failed to find package {package_name:?} in worktree metadata"))
 }
 
 fn get_cargo_package(worktree: &GitWorkTree, package_name: &str) -> anyhow::Result<Package> {
