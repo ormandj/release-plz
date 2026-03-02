@@ -826,6 +826,83 @@ publish = false
     assert!(packages.is_empty());
 }
 
+/// Test that `release` creates a tag even when the Cargo.toml manifest has `publish = false`.
+/// This is the exact scenario where a project is git-only (never published to a registry)
+/// and has `publish = false` directly in its Cargo.toml, not just in release-plz config.
+/// Without the fix, `release_packages()` used `publishable_packages()` which filters out
+/// packages with `publish = false` in Cargo.toml, causing "nothing to release".
+#[tokio::test]
+#[cfg_attr(not(feature = "docker-tests"), ignore)]
+async fn git_only_release_creates_tag_with_publish_false_in_manifest() {
+    use cargo_metadata::semver::Version;
+    use cargo_utils::LocalManifest;
+
+    let context = TestContext::new().await;
+
+    // Set publish = false in the Cargo.toml manifest (this is the key difference
+    // from git_only_release_creates_tag which only sets publish = false in release-plz config)
+    let cargo_toml_path = context.repo_dir().join("Cargo.toml");
+    let mut cargo_toml = LocalManifest::try_new(&cargo_toml_path).unwrap();
+    cargo_toml.data["package"]["publish"] = false.into();
+    cargo_toml.write().unwrap();
+    context.push_all_changes("chore: set publish = false in manifest");
+
+    // Configure with git_only = true and publish = false
+    let config = r#"
+[workspace]
+git_only = true
+publish = false
+"#;
+    context.write_release_plz_toml(config);
+
+    // Create initial release tag and update Cargo.toml to match
+    context.repo.tag("v0.1.0", "Release v0.1.0").unwrap();
+
+    // Update version and make a new commit
+    context.set_package_version(&context.gitea.repo, &Version::parse("0.1.1").unwrap());
+    // Re-apply publish = false since set_package_version overwrites the manifest
+    let mut cargo_toml = LocalManifest::try_new(&cargo_toml_path).unwrap();
+    cargo_toml.data["package"]["publish"] = false.into();
+    cargo_toml.write().unwrap();
+    context.run_cargo_check();
+    context.push_all_changes("fix: bug fix");
+
+    let crate_name = &context.gitea.repo;
+    let expected_tag = "v0.1.1";
+
+    // Verify tag doesn't exist yet
+    let is_tag_created = || {
+        context.repo.git(&["fetch", "--tags"]).unwrap();
+        context.repo.tag_exists(expected_tag).unwrap()
+    };
+    assert!(!is_tag_created(), "Tag should not exist before release");
+
+    // Run release command
+    let outcome = context.run_release().success();
+
+    // Verify JSON output shows the release
+    let expected_stdout = serde_json::json!({
+        "releases": [
+            {
+                "package_name": crate_name,
+                "prs": [],
+                "tag": expected_tag,
+                "version": "0.1.1",
+            }
+        ]
+    })
+    .to_string();
+    outcome.stdout(format!("{expected_stdout}\n"));
+
+    // Verify the tag was created
+    assert!(is_tag_created(), "Tag should exist after release");
+
+    // Verify no packages were published (since publish = false)
+    let dest_dir = Utf8TempDir::new().unwrap();
+    let packages = context.download_package(dest_dir.path());
+    assert!(packages.is_empty());
+}
+
 /// Test for <https://github.com/release-plz/release-plz/issues/2594>
 /// In `git_only` mode, release-plz should NOT check the cargo registry for existing packages.
 /// This test verifies that a package with a name that exists on the cargo registry

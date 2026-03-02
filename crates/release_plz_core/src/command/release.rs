@@ -583,7 +583,7 @@ async fn release_packages(
     git_client: &GitClient,
 ) -> anyhow::Result<Option<Release>> {
     // Packages are already ordered by release order.
-    let packages = project.publishable_packages();
+    let packages = project.workspace_packages();
     if packages.is_empty() {
         info!("nothing to release");
     }
