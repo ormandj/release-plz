@@ -148,20 +148,38 @@ fn process_git_only_package(
     // Run cargo package so we have our finalized package.
     // If cargo package fails (e.g. private workspace crates with `publish = false`
     // and versioned path deps), fall back to source directory comparison.
+    // If the package doesn't exist in the old worktree at all (new crate added
+    // after the previous release), treat it as an initial release.
     let single_package = match run_cargo_package(&worktree) {
-        Ok(()) => get_cargo_package(&worktree, &package.name).with_context(|| {
-            format!(
-                "get cargo package {} from worktree at {:?}",
-                package.name,
-                worktree.path()
-            )
-        })?,
+        Ok(()) => {
+            match get_cargo_package(&worktree, &package.name) {
+                Ok(pkg) => pkg,
+                Err(_) => {
+                    info!(
+                        "Package {} not found in worktree at tag `{release_tag}` — \
+                         treating as initial release (new crate).",
+                        package.name
+                    );
+                    return Ok(None);
+                }
+            }
+        }
         Err(e) => {
             info!(
                 "cargo package failed for {} ({e:#}), using source directory for comparison",
                 package.name
             );
-            get_cargo_package_from_source(&worktree, &package.name)?
+            match get_cargo_package_from_source(&worktree, &package.name) {
+                Ok(pkg) => pkg,
+                Err(_) => {
+                    info!(
+                        "Package {} not found in worktree at tag `{release_tag}` — \
+                         treating as initial release (new crate).",
+                        package.name
+                    );
+                    return Ok(None);
+                }
+            }
         }
     };
 
